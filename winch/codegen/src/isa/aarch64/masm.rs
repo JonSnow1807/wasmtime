@@ -37,9 +37,10 @@ use cranelift_codegen::{
     isa::aarch64::{
         self,
         inst::{
-            self, Cond, ExtendOp, Imm12, ImmLogic, ImmShift, SImm7Scaled, SImm9, ScalarSize,
-            VecALUModOp, VecALUOp, VecExtendOp, VecLanesOp, VecMisc2, VecRRLongOp, VecRRNarrowOp,
-            VecRRPairLongOp, VecRRRLongModOp, VecRRRLongOp, VecShiftImmOp, VectorSize,
+            self, AtomicRMWLoopOp, AtomicRMWOp, Cond, ExtendOp, Imm12, ImmLogic, ImmShift,
+            SImm7Scaled, SImm9, ScalarSize, VecALUModOp, VecALUOp, VecExtendOp, VecLanesOp,
+            VecMisc2, VecRRLongOp, VecRRNarrowOp, VecRRPairLongOp, VecRRRLongModOp, VecRRRLongOp,
+            VecShiftImmOp, VectorSize,
         },
     },
     settings,
@@ -70,6 +71,8 @@ pub(crate) struct MacroAssembler {
     scratch_scope: RegAlloc,
     /// Shared flags.
     shared_flags: settings::Flags,
+    /// ISA-specific flags.
+    isa_flags: aarch64::settings::Flags,
 }
 
 impl MacroAssembler {
@@ -82,11 +85,12 @@ impl MacroAssembler {
         Ok(Self {
             sp_max: 0,
             stack_max_use_add: None,
-            asm: Assembler::new(shared_flags.clone(), isa_flags),
+            asm: Assembler::new(shared_flags.clone(), isa_flags.clone()),
             sp_offset: 0u32,
             ptr_size: ptr_type_from_ptr_size(ptr_size.size()).try_into()?,
             scratch_scope: RegAlloc::from(scratch_gpr_bitset(), scratch_fpr_bitset()),
             shared_flags,
+            isa_flags,
         })
     }
 
@@ -1740,13 +1744,97 @@ impl Masm for MacroAssembler {
 
     fn atomic_rmw(
         &mut self,
-        _context: &mut CodeGenContext<Emission>,
-        _size: OperandSize,
-        _op: RmwOp,
-        _flags: MemFlagsData,
-        _extend: Option<Extend<Zero>>,
+        context: &mut CodeGenContext<Emission>,
+        size: OperandSize,
+        op: RmwOp,
+        flags: MemFlagsData,
+        extend: Option<Extend<Zero>>,
     ) -> Result<()> {
-        Err(format_err!(CodeGenError::unimplemented_masm_instruction()))
+        let operand = context.pop_to_reg(self, None)?;
+        let addr = context.pop_to_reg(self, None)?;
+
+        // Wasm atomic read-modify-write instructions are sequentially
+        // consistent, which the acquire-release forms below provide, as in
+        // Cranelift's lowering. Both forms leave the previous value
+        // zero-extended in a 64-bit register, so the `*_u` variants don't need
+        // an explicit extend.
+        let res = if self.isa_flags.has_lse() {
+            // The ALU operations below work on 32 or 64 bit registers; for 8
+            // and 16 bit accesses only the low bits of the operand are used.
+            let alu_size = if size == OperandSize::S64 {
+                OperandSize::S64
+            } else {
+                OperandSize::S32
+            };
+            let lse_op = match op {
+                RmwOp::Add => AtomicRMWOp::Add,
+                RmwOp::Sub => {
+                    self.asm
+                        .neg_rr(operand.reg, writable!(operand.reg), alu_size);
+                    AtomicRMWOp::Add
+                }
+                RmwOp::And => {
+                    // `ldclr` clears the bits that are set in the operand.
+                    self.asm
+                        .mvn_rr(operand.reg, writable!(operand.reg), alu_size);
+                    AtomicRMWOp::Clr
+                }
+                RmwOp::Or => AtomicRMWOp::Set,
+                RmwOp::Xor => AtomicRMWOp::Eor,
+                RmwOp::Xchg => AtomicRMWOp::Swp,
+            };
+            self.with_aligned_sp(|masm| {
+                masm.asm.atomic_rmw_lse(
+                    lse_op,
+                    operand.reg,
+                    writable!(operand.reg),
+                    addr.reg,
+                    size,
+                    flags,
+                );
+                Ok(())
+            })?;
+            context.free_reg(addr.reg);
+            operand.reg
+        } else {
+            let loop_op = match op {
+                RmwOp::Add => AtomicRMWLoopOp::Add,
+                RmwOp::Sub => AtomicRMWLoopOp::Sub,
+                RmwOp::And => AtomicRMWLoopOp::And,
+                RmwOp::Or => AtomicRMWLoopOp::Orr,
+                RmwOp::Xor => AtomicRMWLoopOp::Eor,
+                RmwOp::Xchg => AtomicRMWLoopOp::Xchg,
+            };
+            let dst = context.any_gpr(self)?;
+            self.with_aligned_sp(|masm| {
+                masm.with_scratch::<IntScratch, _>(|masm, scratch1| {
+                    masm.with_scratch::<IntScratch, _>(|masm, scratch2| {
+                        masm.asm.atomic_rmw_loop(
+                            loop_op,
+                            addr.reg,
+                            operand.reg,
+                            writable!(dst),
+                            scratch1.writable(),
+                            scratch2.writable(),
+                            size,
+                            flags,
+                        );
+                    });
+                });
+                Ok(())
+            })?;
+            context.free_reg(operand.reg);
+            context.free_reg(addr.reg);
+            dst
+        };
+
+        let dst_ty = match extend {
+            Some(ext) => WasmValType::int_from_bits(ext.to_bits()),
+            None => WasmValType::int_from_bits(size.num_bits()),
+        };
+        context.stack.push(TypedReg::new(dst_ty, res).into());
+
+        Ok(())
     }
 
     fn extract_lane(
@@ -1825,12 +1913,56 @@ impl Masm for MacroAssembler {
 
     fn atomic_cas(
         &mut self,
-        _context: &mut CodeGenContext<Emission>,
-        _size: OperandSize,
-        _flags: MemFlagsData,
+        context: &mut CodeGenContext<Emission>,
+        size: OperandSize,
+        flags: MemFlagsData,
         _extend: Option<Extend<Zero>>,
     ) -> Result<()> {
-        Err(format_err!(CodeGenError::unimplemented_masm_instruction()))
+        let replacement = context.pop_to_reg(self, None)?;
+        let expected = context.pop_to_reg(self, None)?;
+        let addr = context.pop_to_reg(self, None)?;
+
+        // As for `atomic_rmw`, both forms are sequentially consistent, compare
+        // only the low `size` bits of `expected`, as the Wasm `*_u` variants
+        // require, and leave the previous value zero-extended in a 64-bit
+        // register, so no explicit extend is needed.
+        let res = if self.isa_flags.has_lse() {
+            self.with_aligned_sp(|masm| {
+                masm.asm.atomic_cas_lse(
+                    writable!(expected.reg),
+                    replacement.reg,
+                    addr.reg,
+                    size,
+                    flags,
+                );
+                Ok(())
+            })?;
+            expected.reg
+        } else {
+            let dst = context.any_gpr(self)?;
+            self.with_aligned_sp(|masm| {
+                masm.with_scratch::<IntScratch, _>(|masm, scratch| {
+                    masm.asm.atomic_cas_loop(
+                        addr.reg,
+                        expected.reg,
+                        replacement.reg,
+                        writable!(dst),
+                        scratch.writable(),
+                        size,
+                        flags,
+                    );
+                });
+                Ok(())
+            })?;
+            context.free_reg(expected.reg);
+            dst
+        };
+
+        context.stack.push(TypedReg::new(expected.ty, res).into());
+        context.free_reg(replacement);
+        context.free_reg(addr.reg);
+
+        Ok(())
     }
 
     fn v128_eq(

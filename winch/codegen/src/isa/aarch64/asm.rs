@@ -23,8 +23,8 @@ use cranelift_codegen::{
     Writable,
     ir::{ExternalName, MemFlagsData, SourceLoc, TrapCode, Type, UserExternalNameRef, types},
     isa::aarch64::inst::{
-        self, ALUOp, ALUOp3, AMode, BitOp, BranchTarget, Cond, CondBrKind, ExtendOp,
-        FPULeftShiftImm, FPUOp1, FPUOp2,
+        self, ALUOp, ALUOp3, AMode, AtomicRMWLoopOp, AtomicRMWOp, BitOp, BranchTarget, Cond,
+        CondBrKind, ExtendOp, FPULeftShiftImm, FPUOp1, FPUOp2,
         FPUOpRI::{self, UShr32, UShr64},
         FPUOpRIMod, FPURightShiftImm, FpuRoundMode, Imm12, ImmLogic, ImmShift, Inst, IntToFpuOp,
         PairAMode, ReturnCallInfo, ScalarSize, VecALUOp, VecLanesOp, VecMisc2, VectorSize,
@@ -313,6 +313,120 @@ impl Assembler {
             rt: rt.into(),
             rn: rn.into(),
             flags,
+        });
+    }
+
+    /// Atomic read-modify-write with acquire-release semantics, using one of
+    /// the LSE instructions: `ldaddal`, `ldclral`, `ldeoral`, `ldsetal` or
+    /// `swpal`, with a `b` or `h` suffix for 8 and 16 bit accesses.
+    ///
+    /// Applies `op` with `rs` to the value at the address in `rn`, and writes
+    /// the previous value at that address, zero-extended, to `rt`.
+    ///
+    /// Requires FEAT_LSE.
+    pub fn atomic_rmw_lse(
+        &mut self,
+        op: AtomicRMWOp,
+        rs: Reg,
+        rt: WritableReg,
+        rn: Reg,
+        size: OperandSize,
+        flags: MemFlagsData,
+    ) {
+        self.emit(Inst::AtomicRMW {
+            op,
+            rs: rs.into(),
+            rt: rt.map(Into::into),
+            rn: rn.into(),
+            ty: Self::atomic_access_ty(size),
+            flags,
+        });
+    }
+
+    /// Atomic compare-and-swap with acquire-release semantics: `casal`,
+    /// `casalh` or `casalb`.
+    ///
+    /// Compares the value at the address in `rn` with `rd` and, if they are
+    /// equal, stores `rt` at that address. In both cases, `rd` gets the
+    /// previous value at that address, zero-extended.
+    ///
+    /// Requires FEAT_LSE.
+    pub fn atomic_cas_lse(
+        &mut self,
+        rd: WritableReg,
+        rt: Reg,
+        rn: Reg,
+        size: OperandSize,
+        flags: MemFlagsData,
+    ) {
+        self.emit(Inst::AtomicCAS {
+            rd: rd.map(Into::into),
+            rs: rd.to_reg().into(),
+            rt: rt.into(),
+            rn: rn.into(),
+            ty: Self::atomic_access_ty(size),
+            flags,
+        });
+    }
+
+    /// Atomic read-modify-write implemented as a load-exclusive /
+    /// store-exclusive loop (`ldaxr` / `stlxr`), with acquire-release
+    /// semantics.
+    ///
+    /// Applies `op` with `operand` to the value at the address in `addr`, and
+    /// writes the previous value at that address, zero-extended, to `oldval`.
+    /// `oldval`, `scratch1` and `scratch2` are clobbered and must be distinct
+    /// from each other and from `addr` and `operand`.
+    pub fn atomic_rmw_loop(
+        &mut self,
+        op: AtomicRMWLoopOp,
+        addr: Reg,
+        operand: Reg,
+        oldval: WritableReg,
+        scratch1: WritableReg,
+        scratch2: WritableReg,
+        size: OperandSize,
+        flags: MemFlagsData,
+    ) {
+        self.emit(Inst::AtomicRMWLoop {
+            ty: Self::atomic_access_ty(size),
+            op,
+            flags,
+            addr: addr.into(),
+            operand: operand.into(),
+            oldval: oldval.map(Into::into),
+            scratch1: scratch1.map(Into::into),
+            scratch2: scratch2.map(Into::into),
+        });
+    }
+
+    /// Atomic compare-and-swap implemented as a load-exclusive /
+    /// store-exclusive loop (`ldaxr` / `stlxr`), with acquire-release
+    /// semantics.
+    ///
+    /// Compares the value at the address in `addr` with the low `size` bits
+    /// of `expected` and, if they are equal, stores `replacement` at that
+    /// address. In both cases, `oldval` gets the previous value at that
+    /// address, zero-extended. `oldval` and `scratch` are clobbered and must
+    /// be distinct from each other and from the other registers.
+    pub fn atomic_cas_loop(
+        &mut self,
+        addr: Reg,
+        expected: Reg,
+        replacement: Reg,
+        oldval: WritableReg,
+        scratch: WritableReg,
+        size: OperandSize,
+        flags: MemFlagsData,
+    ) {
+        self.emit(Inst::AtomicCASLoop {
+            ty: Self::atomic_access_ty(size),
+            flags,
+            addr: addr.into(),
+            expected: expected.into(),
+            replacement: replacement.into(),
+            oldval: oldval.map(Into::into),
+            scratch: scratch.map(Into::into),
         });
     }
 
@@ -968,6 +1082,11 @@ impl Assembler {
     /// Xor with three registers.
     pub fn xor_rrr(&mut self, rm: Reg, rn: Reg, rd: WritableReg, size: OperandSize) {
         self.alu_rrr(ALUOp::Eor, rm, rn, rd, size);
+    }
+
+    /// Bitwise not (`mvn`) of a general-purpose register.
+    pub fn mvn_rr(&mut self, rm: Reg, rd: WritableReg, size: OperandSize) {
+        self.alu_rrr(ALUOp::OrrNot, rm, zero(), rd, size);
     }
 
     /// Xor immediate and register.

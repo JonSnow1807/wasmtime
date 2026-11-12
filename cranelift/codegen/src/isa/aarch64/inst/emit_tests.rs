@@ -7314,6 +7314,22 @@ fn test_aarch64_binemit() {
         "3BFF5F487F233A6B7C839A9A3CFF184898FFFFB5",
         "atomic_rmw_loop_umax_16 addr=x25 operand=x26 oldval=x27 scratch1=x24 scratch2=x28",
     ));
+    // The loop uses the registers it is given, not just the ones Cranelift's
+    // lowering fixes it to.
+    insns.push((
+        Inst::AtomicRMWLoop {
+            ty: I32,
+            op: AtomicRMWLoopOp::Add,
+            flags: MemFlagsData::trusted(),
+            addr: xreg(0),
+            operand: xreg(1),
+            oldval: writable_xreg(2),
+            scratch1: writable_xreg(16),
+            scratch2: writable_xreg(17),
+        },
+        "02FC5F885100010B11FC1088B0FFFFB5",
+        "atomic_rmw_loop_add_32 addr=x0 operand=x1 oldval=x2 scratch1=x16 scratch2=x17",
+    ));
 
     insns.push((
         Inst::AtomicRMW128Loop {
@@ -7915,6 +7931,20 @@ fn test_aarch64_binemit() {
         },
         "3BFF5FC87F031AEB610000543CFF18C898FFFFB5",
         "atomic_cas_loop_64 addr=x25, expect=x26, replacement=x28, oldval=x27, scratch=x24",
+    ));
+
+    insns.push((
+        Inst::AtomicCASLoop {
+            ty: I16,
+            flags: MemFlagsData::trusted(),
+            addr: xreg(0),
+            expected: xreg(1),
+            replacement: xreg(2),
+            oldval: writable_xreg(3),
+            scratch: writable_xreg(16),
+        },
+        "03FC5F487F2021EB6100005402FC104890FFFFB5",
+        "atomic_cas_loop_16 addr=x0, expect=x1, replacement=x2, oldval=x3, scratch=x16",
     ));
 
     insns.push((

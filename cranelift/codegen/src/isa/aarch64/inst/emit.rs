@@ -1537,35 +1537,39 @@ impl MachInstEmit for Inst {
 
                 sink.put4(enc_acq_rel(ty, op, rs, rt, rn));
             }
-            &Inst::AtomicRMWLoop { ty, op, flags, .. } => {
+            &Inst::AtomicRMWLoop {
+                ty,
+                op,
+                flags,
+                addr,
+                operand,
+                oldval,
+                scratch1,
+                scratch2,
+            } => {
                 /* Emit this:
                      again:
-                      ldaxr{,b,h}  x/w27, [x25]
+                      ldaxr{,b,h}  x/w(oldval), [addr]
                       // maybe sign extend
-                      op          x28, x27, x26 // op is add,sub,and,orr,eor
-                      stlxr{,b,h}  w24, x/w28, [x25]
-                      cbnz        x24, again
+                      op          scratch2, oldval, operand // op is add,sub,and,orr,eor
+                      stlxr{,b,h}  w(scratch1), x/w(scratch2), [addr]
+                      cbnz        scratch1, again
 
                    Operand conventions:
-                      IN:  x25 (addr), x26 (2nd arg for op)
-                      OUT: x27 (old value), x24 (trashed), x28 (trashed)
+                      IN:  addr, operand (2nd arg for op)
+                      OUT: oldval (old value), scratch1 (trashed), scratch2 (trashed)
 
-                   It is unfortunate that, per the ARM documentation, x28 cannot be used for
-                   both the store-data and success-flag operands of stlxr.  This causes the
-                   instruction's behaviour to be "CONSTRAINED UNPREDICTABLE", so we use x24
-                   instead for the success-flag.
+                   `oldval`, `scratch1` and `scratch2` must be distinct from each other and
+                   from `addr` and `operand`. Cranelift's lowering fixes them to x25 (addr),
+                   x26 (operand), x27 (oldval), x24 (scratch1) and x28 (scratch2); Winch
+                   picks its own registers.
+
+                   It is unfortunate that, per the ARM documentation, scratch2 cannot be used
+                   for both the store-data and success-flag operands of stlxr.  This causes
+                   the instruction's behaviour to be "CONSTRAINED UNPREDICTABLE", so we use
+                   scratch1 instead for the success-flag.
                 */
-                // TODO: We should not hardcode registers here, a better idea would be to
-                // pass some scratch registers in the AtomicRMWLoop pseudo-instruction, and use those
                 let xzr = zero_reg();
-                let x24 = xreg(24);
-                let x25 = xreg(25);
-                let x26 = xreg(26);
-                let x27 = xreg(27);
-                let x28 = xreg(28);
-                let x24wr = writable_xreg(24);
-                let x27wr = writable_xreg(27);
-                let x28wr = writable_xreg(28);
                 let again_label = sink.get_label();
 
                 // again:
@@ -1575,7 +1579,7 @@ impl MachInstEmit for Inst {
                     sink.add_trap(trap_code);
                 }
 
-                sink.put4(enc_ldaxr(ty, x27wr, x25)); // ldaxr x27, [x25]
+                sink.put4(enc_ldaxr(ty, oldval, addr)); // ldaxr oldval, [addr]
                 let size = OperandSize::from_ty(ty);
                 let sign_ext = match op {
                     AtomicRMWLoopOp::Smin | AtomicRMWLoopOp::Smax => match ty {
@@ -1595,30 +1599,31 @@ impl MachInstEmit for Inst {
                 };
                 // sxt{b|h} the loaded result if necessary.
                 if let Some(op) = sign_ext {
-                    Inst::gen_extend(x27wr, x27, op, size).emit(sink, emit_info, state);
+                    Inst::gen_extend(oldval, oldval.to_reg(), op, size)
+                        .emit(sink, emit_info, state);
                 }
 
                 match op {
                     AtomicRMWLoopOp::Xchg => {} // do nothing
                     AtomicRMWLoopOp::Nand => {
-                        // and x28, x27, x26
-                        // mvn x28, x28
+                        // and scratch2, oldval, operand
+                        // mvn scratch2, scratch2
 
                         Inst::AluRRR {
                             alu_op: ALUOp::And,
                             size,
-                            rd: x28wr,
-                            rn: x27,
-                            rm: x26,
+                            rd: scratch2,
+                            rn: oldval.to_reg(),
+                            rm: operand,
                         }
                         .emit(sink, emit_info, state);
 
                         Inst::AluRRR {
                             alu_op: ALUOp::OrrNot,
                             size,
-                            rd: x28wr,
+                            rd: scratch2,
                             rn: xzr,
-                            rm: x28,
+                            rm: scratch2.to_reg(),
                         }
                         .emit(sink, emit_info, state);
                     }
@@ -1626,8 +1631,8 @@ impl MachInstEmit for Inst {
                     | AtomicRMWLoopOp::Umax
                     | AtomicRMWLoopOp::Smin
                     | AtomicRMWLoopOp::Smax => {
-                        // cmp x27, x26 {?sxt}
-                        // csel.op x28, x27, x26
+                        // cmp oldval, operand {?sxt}
+                        // csel.op scratch2, oldval, operand
 
                         let cond = match op {
                             AtomicRMWLoopOp::Umin => Cond::Lo,
@@ -1642,8 +1647,8 @@ impl MachInstEmit for Inst {
                                 alu_op: ALUOp::SubS,
                                 size,
                                 rd: writable_zero_reg(),
-                                rn: x27,
-                                rm: x26,
+                                rn: oldval.to_reg(),
+                                rm: operand,
                                 extendop,
                             }
                             .emit(sink, emit_info, state);
@@ -1652,22 +1657,22 @@ impl MachInstEmit for Inst {
                                 alu_op: ALUOp::SubS,
                                 size,
                                 rd: writable_zero_reg(),
-                                rn: x27,
-                                rm: x26,
+                                rn: oldval.to_reg(),
+                                rm: operand,
                             }
                             .emit(sink, emit_info, state);
                         }
 
                         Inst::CSel {
                             cond,
-                            rd: x28wr,
-                            rn: x27,
-                            rm: x26,
+                            rd: scratch2,
+                            rn: oldval.to_reg(),
+                            rm: operand,
                         }
                         .emit(sink, emit_info, state);
                     }
                     _ => {
-                        // add/sub/and/orr/eor x28, x27, x26
+                        // add/sub/and/orr/eor scratch2, oldval, operand
                         let alu_op = match op {
                             AtomicRMWLoopOp::Add => ALUOp::Add,
                             AtomicRMWLoopOp::Sub => ALUOp::Sub,
@@ -1685,9 +1690,9 @@ impl MachInstEmit for Inst {
                         Inst::AluRRR {
                             alu_op,
                             size,
-                            rd: x28wr,
-                            rn: x27,
-                            rm: x26,
+                            rd: scratch2,
+                            rn: oldval.to_reg(),
+                            rm: operand,
                         }
                         .emit(sink, emit_info, state);
                     }
@@ -1697,18 +1702,18 @@ impl MachInstEmit for Inst {
                     sink.add_trap(trap_code);
                 }
                 if op == AtomicRMWLoopOp::Xchg {
-                    sink.put4(enc_stlxr(ty, x24wr, x26, x25)); // stlxr w24, x26, [x25]
+                    sink.put4(enc_stlxr(ty, scratch1, operand, addr)); // stlxr scratch1, operand, [addr]
                 } else {
-                    sink.put4(enc_stlxr(ty, x24wr, x28, x25)); // stlxr w24, x28, [x25]
+                    sink.put4(enc_stlxr(ty, scratch1, scratch2.to_reg(), addr)); // stlxr scratch1, scratch2, [addr]
                 }
 
-                // cbnz w24, again
-                // Note, we're actually testing x24, and relying on the default zero-high-half
-                // rule in the assignment that `stlxr` does.
+                // cbnz scratch1, again
+                // Note, we're actually testing the X form of scratch1, and relying on the
+                // default zero-high-half rule in the assignment that `stlxr` does.
                 let br_offset = sink.cur_offset();
                 sink.put4(enc_conditional_br(
                     BranchTarget::Label(again_label),
-                    CondBrKind::NotZero(x24, OperandSize::Size64),
+                    CondBrKind::NotZero(scratch1.to_reg(), OperandSize::Size64),
                 ));
                 sink.use_label_at_offset(br_offset, again_label, LabelUse::Branch19);
             }
@@ -1941,28 +1946,34 @@ impl MachInstEmit for Inst {
 
                 sink.put4(enc_casp(rd_lo, rt_lo, rn));
             }
-            &Inst::AtomicCASLoop { ty, flags, .. } => {
+            &Inst::AtomicCASLoop {
+                ty,
+                flags,
+                addr,
+                expected,
+                replacement,
+                oldval,
+                scratch,
+            } => {
                 /* Emit this:
                     again:
-                     ldaxr{,b,h} x/w27, [x25]
-                     cmp         x/w27, x/w26 uxt{b,h}
+                     ldaxr{,b,h} x/w(oldval), [addr]
+                     cmp         x/w(oldval), x/w(expected) uxt{b,h}
                      b.ne        out
-                     stlxr{,b,h} w24, x/w28, [x25]
-                     cbnz        x24, again
+                     stlxr{,b,h} w(scratch), x/w(replacement), [addr]
+                     cbnz        scratch, again
                     out:
 
                   Operand conventions:
-                     IN:  x25 (addr), x26 (expected value), x28 (replacement value)
-                     OUT: x27 (old value), x24 (trashed)
+                     IN:  addr, expected (expected value), replacement (replacement value)
+                     OUT: oldval (old value), scratch (trashed)
+
+                  `oldval` and `scratch` must be distinct from each other and from `addr`,
+                  `expected` and `replacement`. Cranelift's lowering fixes them to x25
+                  (addr), x26 (expected), x28 (replacement), x27 (oldval) and x24 (scratch);
+                  Winch picks its own registers.
                 */
-                let x24 = xreg(24);
-                let x25 = xreg(25);
-                let x26 = xreg(26);
-                let x27 = xreg(27);
-                let x28 = xreg(28);
                 let xzrwr = writable_zero_reg();
-                let x24wr = writable_xreg(24);
-                let x27wr = writable_xreg(27);
                 let again_label = sink.get_label();
                 let out_label = sink.get_label();
 
@@ -1973,8 +1984,8 @@ impl MachInstEmit for Inst {
                     sink.add_trap(trap_code);
                 }
 
-                // ldaxr x27, [x25]
-                sink.put4(enc_ldaxr(ty, x27wr, x25));
+                // ldaxr oldval, [addr]
+                sink.put4(enc_ldaxr(ty, oldval, addr));
 
                 // The top 32-bits are zero-extended by the ldaxr so for I64
                 // we don't have to use UXTW, just the x-form of the
@@ -1990,8 +2001,14 @@ impl MachInstEmit for Inst {
                     _ => (0b1, 0b0, 0b000000),
                 };
                 let bits_31_21 = (sf << 10) | 0b011_01011_000 | bit21;
-                // cmp x27, x26 (== subs xzr, x27, x26)
-                sink.put4(enc_arith_rrr(bits_31_21, extend_op, xzrwr, x27, x26));
+                // cmp oldval, expected (== subs xzr, oldval, expected)
+                sink.put4(enc_arith_rrr(
+                    bits_31_21,
+                    extend_op,
+                    xzrwr,
+                    oldval.to_reg(),
+                    expected,
+                ));
 
                 // b.ne out
                 let br_out_offset = sink.cur_offset();
@@ -2005,15 +2022,16 @@ impl MachInstEmit for Inst {
                     sink.add_trap(trap_code);
                 }
 
-                sink.put4(enc_stlxr(ty, x24wr, x28, x25)); // stlxr w24, x28, [x25]
+                // stlxr scratch, replacement, [addr]
+                sink.put4(enc_stlxr(ty, scratch, replacement, addr));
 
-                // cbnz w24, again.
-                // Note, we're actually testing x24, and relying on the default zero-high-half
-                // rule in the assignment that `stlxr` does.
+                // cbnz scratch, again.
+                // Note, we're actually testing the X form of scratch, and relying on the
+                // default zero-high-half rule in the assignment that `stlxr` does.
                 let br_again_offset = sink.cur_offset();
                 sink.put4(enc_conditional_br(
                     BranchTarget::Label(again_label),
-                    CondBrKind::NotZero(x24, OperandSize::Size64),
+                    CondBrKind::NotZero(scratch.to_reg(), OperandSize::Size64),
                 ));
                 sink.use_label_at_offset(br_again_offset, again_label, LabelUse::Branch19);
 
