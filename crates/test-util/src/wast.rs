@@ -532,11 +532,7 @@ impl Compiler {
                     return true;
                 }
 
-                if cfg!(target_arch = "aarch64") {
-                    return config.threads();
-                }
-
-                !cfg!(target_arch = "x86_64")
+                !(cfg!(target_arch = "x86_64") || cfg!(target_arch = "aarch64"))
             }
 
             Compiler::CraneliftPulley => {
@@ -643,6 +639,22 @@ impl WastTest {
 
             if unsupported.iter().any(|part| self.path.ends_with(part)) {
                 return true;
+            }
+
+            #[cfg(target_arch = "aarch64")]
+            {
+                // Threads tests which use atomic instructions that Winch
+                // doesn't implement yet on aarch64.
+                let unsupported = [
+                    "misc_testsuite/memory64/threads.wast",
+                    "misc_testsuite/threads/shared-memory-grow.wast",
+                    "misc_testsuite/winch/rmw32_cmpxchg_u_wrap.wast",
+                    "spec_testsuite/proposals/threads/atomic.wast",
+                ];
+
+                if unsupported.iter().any(|part| self.path.ends_with(part)) {
+                    return true;
+                }
             }
 
             #[cfg(target_arch = "x86_64")]

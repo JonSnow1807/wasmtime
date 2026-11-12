@@ -2632,17 +2632,6 @@ impl Config {
                     | WasmFeatures::RELAXED_SIMD
                     | WasmFeatures::LEGACY_EXCEPTIONS
                     | WasmFeatures::STACK_SWITCHING;
-
-                match self.compiler_target().architecture {
-                    target_lexicon::Architecture::Aarch64(_) => {
-                        unsupported |= WasmFeatures::THREADS;
-                    }
-
-                    // Winch doesn't support other non-x64 architectures at this
-                    // time either but will return an first-class error for
-                    // them.
-                    _ => {}
-                }
             }
             Some(Strategy::Auto) => unreachable!(),
         }

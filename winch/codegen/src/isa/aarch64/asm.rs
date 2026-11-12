@@ -21,7 +21,7 @@ use cranelift_codegen::isa::aarch64::inst::{
 use cranelift_codegen::{
     MachBuffer, MachBufferFinalized, MachInst, MachInstEmit, MachInstEmitState, MachLabel,
     Writable,
-    ir::{ExternalName, MemFlagsData, SourceLoc, TrapCode, UserExternalNameRef},
+    ir::{ExternalName, MemFlagsData, SourceLoc, TrapCode, Type, UserExternalNameRef, types},
     isa::aarch64::inst::{
         self, ALUOp, ALUOp3, AMode, BitOp, BranchTarget, Cond, CondBrKind, ExtendOp,
         FPULeftShiftImm, FPUOp1, FPUOp2,
@@ -289,6 +289,43 @@ impl Assembler {
         };
 
         self.emit(inst);
+    }
+
+    /// Load-acquire register: `ldar`, `ldarh` or `ldarb`, depending on
+    /// `size`.
+    ///
+    /// The 8 and 16 bit variants zero-extend the loaded value into the
+    /// destination register.
+    pub fn ldar(&mut self, rn: Reg, rt: WritableReg, size: OperandSize, flags: MemFlagsData) {
+        self.emit(Inst::LoadAcquire {
+            access_ty: Self::atomic_access_ty(size),
+            rt: rt.map(Into::into),
+            rn: rn.into(),
+            flags,
+        });
+    }
+
+    /// Store-release register: `stlr`, `stlrh` or `stlrb`, depending on
+    /// `size`.
+    pub fn stlr(&mut self, rt: Reg, rn: Reg, size: OperandSize, flags: MemFlagsData) {
+        self.emit(Inst::StoreRelease {
+            access_ty: Self::atomic_access_ty(size),
+            rt: rt.into(),
+            rn: rn.into(),
+            flags,
+        });
+    }
+
+    /// The integer type accessed by a single-register atomic memory
+    /// instruction of the given size.
+    fn atomic_access_ty(size: OperandSize) -> Type {
+        match size {
+            OperandSize::S8 => types::I8,
+            OperandSize::S16 => types::I16,
+            OperandSize::S32 => types::I32,
+            OperandSize::S64 => types::I64,
+            s => panic!("Invalid operand size for atomic access {s:?}"),
+        }
     }
 
     /// Load a pair of registers.

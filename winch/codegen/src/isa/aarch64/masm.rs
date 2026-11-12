@@ -143,6 +143,26 @@ impl MacroAssembler {
         Ok(res)
     }
 
+    /// Calls `f` with a register holding the effective address of `addr`.
+    ///
+    /// Some instructions, like `ldar` and `stlr`, only support a base
+    /// register with no offset. If `addr` has a non-zero offset, the
+    /// address is materialized into a scratch register first.
+    fn with_addr_in_reg(
+        &mut self,
+        addr: Address,
+        f: impl FnOnce(&mut Self, Reg) -> Result<()>,
+    ) -> Result<()> {
+        let (base, offset) = addr.unwrap_offset();
+        if offset == 0 {
+            return f(self, base);
+        }
+        self.with_scratch::<IntScratch, _>(|masm, scratch| {
+            masm.add_ir(scratch.writable(), base, I::i64(offset), OperandSize::S64)?;
+            f(masm, scratch.inner())
+        })
+    }
+
     /// Calculate the tail callee's entry SP, restore the old frame, and then
     /// update SP. All old-frame reads must precede the SP update so signal
     /// handlers cannot overwrite the frame before it is restored.
@@ -480,8 +500,16 @@ impl Masm for MacroAssembler {
                 masm.asm.str(src, mem, size, UNTRUSTED_FLAGS);
                 Ok(())
             }),
-            StoreKind::Atomic(_size) => {
-                Err(format_err!(CodeGenError::unimplemented_masm_instruction()))
+            StoreKind::Atomic(size) => {
+                if size == OperandSize::S128 {
+                    bail!(CodeGenError::unexpected_operand_size());
+                }
+                // Wasm atomic stores are sequentially consistent, which
+                // `stlr` provides on AArch64.
+                masm.with_addr_in_reg(dst, |masm, base| {
+                    masm.asm.stlr(src, base, size, UNTRUSTED_FLAGS);
+                    Ok(())
+                })
             }
             StoreKind::VectorLane(LaneSelector { lane, size }) => masm
                 .with_scratch::<IntScratch, _>(|masm, scratch| {
@@ -701,7 +729,19 @@ impl Masm for MacroAssembler {
                     Ok(())
                 })
             }
-            LoadKind::Atomic(_, _) => bail!(CodeGenError::unimplemented_masm_instruction()),
+            LoadKind::Atomic(_, _) => {
+                if size == OperandSize::S128 {
+                    bail!(CodeGenError::unexpected_operand_size());
+                }
+                // Wasm atomic loads are sequentially consistent, which `ldar`
+                // provides on AArch64. Like `ldrb` and `ldrh`, `ldarb` and
+                // `ldarh` zero-extend into the destination register, so the
+                // `*_u` variants don't need an explicit extend.
+                masm.with_addr_in_reg(src, |masm, base| {
+                    masm.asm.ldar(base, dst, size, UNTRUSTED_FLAGS);
+                    Ok(())
+                })
+            }
         })
     }
 
